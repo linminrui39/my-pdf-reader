@@ -13,18 +13,16 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
 
 # --- 配置區 ---
-# 請確保這裡填寫的是您的資料夾 ID
-DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN"
+DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN" 
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 SAVE_DIR = "temp_books"
-PROGRESS_FILE = "drive_progress.json"
 VOICE = "zh-TW-HsiaoChenNeural"
 SPEED = "+10%"
 PREFETCH_COUNT = 2
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- Google Drive 服務初始化 ---
+# --- Google Drive 服務 ---
 @st.cache_resource
 def get_drive_service():
     try:
@@ -38,7 +36,7 @@ def get_drive_service():
 
 drive_service = get_drive_service()
 
-# --- 雲端檔案同步功能 ---
+# --- 雲端檔案同步 ---
 def list_drive_files():
     if not drive_service: return []
     query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
@@ -53,52 +51,43 @@ def download_file(file_id, local_path):
     while not done:
         _, done = downloader.next_chunk()
 
-def upload_file(local_path, filename):
-    try:
-        file_metadata = {'name': filename, 'parents': [DRIVE_FOLDER_ID]}
-        media = MediaFileUpload(local_path, mimetype='application/pdf')
-        drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return True
-    except Exception as e:
-        if "storageQuotaExceeded" in str(e):
-            st.warning("⚠️ 因 Google 空間限制，請直接將 PDF 丟進雲端硬碟，App 會自動抓取。")
-        else:
-            st.error(f"上傳失敗: {e}")
-        return False
+# --- 【修正 1：獨立進度儲存系統】 ---
+def get_prog_filename(book_name):
+    # 將書名轉為合法的進度檔名
+    safe_name = "".join([c for c in book_name if c.isalnum() or c in (' ', '.', '_')]).rstrip()
+    return f"prog_{safe_name}.json"
 
-# --- 進度儲存 (修正 TypeError 關鍵區塊) ---
-def load_remote_progress():
+def load_book_progress(book_name):
     try:
-        query = f"name = '{PROGRESS_FILE}' and '{DRIVE_FOLDER_ID}' in parents"
+        filename = get_prog_filename(book_name)
+        query = f"name = '{filename}' and '{DRIVE_FOLDER_ID}' in parents"
         res = drive_service.files().list(q=query).execute().get('files', [])
         if res:
             request = drive_service.files().get_media(fileId=res[0]['id'])
-            return json.loads(request.execute())
-    except: pass
-    return {}
+            prog_data = json.loads(request.execute())
+            return prog_data.get("page", 0)
+    except:
+        pass
+    return 0
 
-def save_remote_progress(book_name, page_num):
+def save_book_progress(book_name, page_num):
     try:
-        data = load_remote_progress()
-        data[book_name] = page_num
-        content = json.dumps(data).encode('utf-8')
+        filename = get_prog_filename(book_name)
+        content = json.dumps({"page": page_num}).encode('utf-8')
         
-        query = f"name = '{PROGRESS_FILE}' and '{DRIVE_FOLDER_ID}' in parents"
+        query = f"name = '{filename}' and '{DRIVE_FOLDER_ID}' in parents"
         res = drive_service.files().list(q=query).execute().get('files', [])
         
-        # 修正：使用 MediaIoBaseUpload 處理記憶體中的 Bytes，防止 TypeError
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype='application/json', resumable=True)
-        
         if res:
             drive_service.files().update(fileId=res[0]['id'], media_body=media).execute()
         else:
-            meta = {'name': PROGRESS_FILE, 'parents': [DRIVE_FOLDER_ID]}
+            meta = {'name': filename, 'parents': [DRIVE_FOLDER_ID]}
             drive_service.files().create(body=meta, media_body=media).execute()
     except:
-        # 即使同步失敗也不要跳出紅色報錯，背景處理即可
         pass
 
-# --- 核心功能 (OCR 與圖片) ---
+# --- 核心閱讀功能 ---
 @st.cache_data(show_spinner=False)
 def get_page_content(book_path, page_num):
     doc = fitz.open(book_path)
@@ -122,7 +111,6 @@ def get_audio(text):
         return data
     return asyncio.run(gen())
 
-# --- 背景預讀 ---
 def background_prefetch(book_path, current_page, total_pages):
     def prefetch_worker():
         for i in range(1, PREFETCH_COUNT + 1):
@@ -134,7 +122,14 @@ def background_prefetch(book_path, current_page, total_pages):
 # --- UI 介面 ---
 st.set_page_config(page_title="專業雲端閱讀器", layout="centered")
 
-if st.session_state.get("current_book") is None:
+# 初始化 Session State
+if "current_book" not in st.session_state:
+    st.session_state.current_book = None
+if "temp_page" not in st.session_state:
+    st.session_state.temp_page = 0
+
+# --- 1. 圖書館模式 ---
+if st.session_state.current_book is None:
     st.title("📚 我的雲端書庫")
     files = list_drive_files()
     pdf_files = [x for x in files if x['name'].lower().endswith('.pdf')]
@@ -146,31 +141,27 @@ if st.session_state.get("current_book") is None:
                 if st.button(f"📖 {f['name']}", key=f['id']):
                     l_path = os.path.join(SAVE_DIR, f['name'])
                     if not os.path.exists(l_path):
-                        with st.spinner("同步中..."): download_file(f['id'], l_path)
+                        with st.spinner("下載中..."): download_file(f['id'], l_path)
+                    
+                    # 【修正 2：切換書籍時強制從雲端讀取該書進度】
                     st.session_state.current_book = f['name']
+                    st.session_state.temp_page = load_book_progress(f['name'])
                     st.rerun()
             with c2:
                 if st.button("🗑️", key=f"del_{f['id']}"):
                     drive_service.files().delete(fileId=f['id']).execute()
                     st.rerun()
     st.divider()
-    up = st.file_uploader("匯入新 PDF", type="pdf")
-    if up:
-        l_path = os.path.join(SAVE_DIR, up.name)
-        with open(l_path, "wb") as f: f.write(up.getbuffer())
-        if upload_file(l_path, up.name):
-            st.session_state.current_book = up.name
-            st.rerun()
+    st.info("💡 提示：請直接將 PDF 放入 Google Drive 資料夾，然後重新整理本頁面。")
+
+# --- 2. 閱讀器模式 ---
 else:
     book_name = st.session_state.current_book
     book_path = os.path.join(SAVE_DIR, book_name)
     doc = fitz.open(book_path)
     total = len(doc)
     
-    if "temp_page" not in st.session_state:
-        st.session_state.temp_page = load_remote_progress().get(book_name, 0)
-
-    # 頂部控制
+    # 頂部導覽
     col_nav1, col_nav2 = st.columns([0.3, 0.7])
     with col_nav1:
         if st.button("❮ 返回"):
@@ -179,11 +170,13 @@ else:
     with col_nav2:
         auto_next = st.toggle("自動翻頁", value=False)
 
-    # 跳轉按鈕在上方 (優先顯示)
-    t_page = st.number_input(f"頁碼 / 共 {total} 頁", 1, total, st.session_state.temp_page + 1)
+    # 頁碼輸入
+    t_page = st.number_input(f"頁碼 (1-{total})", 1, total, st.session_state.temp_page + 1)
+    
+    # 如果頁碼變動，則儲存
     if t_page - 1 != st.session_state.temp_page:
         st.session_state.temp_page = t_page - 1
-        save_remote_progress(book_name, st.session_state.temp_page)
+        save_book_progress(book_name, st.session_state.temp_page)
         st.rerun()
 
     st.divider()
@@ -197,7 +190,7 @@ else:
     if audio:
         st.audio(audio, format="audio/mp3", autoplay=auto_next)
 
-    # 觸發背景預讀
+    # 背景預讀
     background_prefetch(book_path, st.session_state.temp_page, total)
 
     # 底部按鈕
@@ -206,11 +199,12 @@ else:
     with b1:
         if st.button("❮ 上一頁") and st.session_state.temp_page > 0:
             st.session_state.temp_page -= 1
-            save_remote_progress(book_name, st.session_state.temp_page)
+            save_book_progress(book_name, st.session_state.temp_page)
             st.rerun()
     with b2:
         if st.button("下一頁 ❯") and st.session_state.temp_page < total - 1:
             st.session_state.temp_page += 1
-            save_remote_progress(book_name, st.session_state.temp_page)
+            save_book_progress(book_name, st.session_state.temp_page)
             st.rerun()
+
 
