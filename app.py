@@ -1,4 +1,3 @@
-%%writefile app.py
 import streamlit as st
 import fitz
 import asyncio
@@ -18,18 +17,22 @@ SAVE_DIR = "my_books"
 PROGRESS_FILE = "progress.json"
 VOICE = "zh-TW-HsiaoChenNeural"
 SPEED = "+10%"
+PREFETCH_COUNT = 2
 
 # 確保資料夾存在
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR, exist_ok=True)
 
+# --- 核心快取層 ---
 @st.cache_data(show_spinner=False)
 def get_page_image(book_path, page_num):
     try:
         doc = fitz.open(book_path)
         page = doc[page_num]
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        return pix.tobytes("png")
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        return img_bytes
     except:
         return None
 
@@ -42,8 +45,8 @@ def get_processed_text(book_path, page_num):
         if not text:
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img = Image.open(io.BytesIO(pix.tobytes("png")))
-            # 強制指定繁體中文與英文
             text = pytesseract.image_to_string(img, lang='chi_tra+eng')
+        doc.close()
         return text.replace('\n', ' ')
     except:
         return ""
@@ -61,6 +64,17 @@ def get_cached_audio(text):
         return asyncio.run(generate())
     except:
         return None
+
+# --- 背景預讀機制 ---
+def background_prefetch(book_path, current_page, total_pages):
+    def prefetch_worker():
+        for i in range(1, PREFETCH_COUNT + 1):
+            target = current_page + i
+            if target < total_pages:
+                _ = get_page_image(book_path, target)
+                txt = get_processed_text(book_path, target)
+                _ = get_cached_audio(txt)
+    threading.Thread(target=prefetch_worker, daemon=True).start()
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
@@ -92,6 +106,7 @@ if st.session_state.current_book is None:
             with col_b1:
                 if st.button(f"📖 繼續閱讀：{book}", key=book):
                     st.session_state.current_book = book
+                    if "temp_page" in st.session_state: del st.session_state.temp_page
                     st.rerun()
             with col_b2:
                 if st.button("🗑️", key=f"del_{book}"):
@@ -103,63 +118,68 @@ if st.session_state.current_book is None:
         with open(os.path.join(SAVE_DIR, uploaded_file.name), "wb") as f:
             f.write(uploaded_file.getbuffer())
         st.session_state.current_book = uploaded_file.name
+        if "temp_page" in st.session_state: del st.session_state.temp_page
         st.rerun()
 
 # 2. 閱讀器模式
 else:
     book_name = st.session_state.current_book
     book_path = os.path.join(SAVE_DIR, book_name)
-    try:
-        doc_info = fitz.open(book_path)
+    
+    with fitz.open(book_path) as doc_info:
         total_pages = len(doc_info)
-        doc_info.close()
-        
-        if "temp_page" not in st.session_state:
-            st.session_state.temp_page = load_progress().get(book_name, 0)
+    
+    if "temp_page" not in st.session_state:
+        st.session_state.temp_page = load_progress().get(book_name, 0)
 
-        # 頂部控制
-        c1, c2 = st.columns([0.4, 0.6])
-        with c1:
-            if st.button("❮ 返回"):
-                st.session_state.current_book = None
-                st.rerun()
-        with c2:
-            auto_next = st.toggle("自動翻頁", value=False)
-
-        # 跳轉頁面
-        col_j1, col_j2 = st.columns([0.6, 0.4])
-        with col_j1:
-            target_page = st.number_input(f"頁碼 (共 {total_pages} 頁)", min_value=1, max_value=total_pages, value=st.session_state.temp_page + 1)
-        with col_j2:
-            if st.button("🚀 跳轉"):
-                st.session_state.temp_page = target_page - 1
-                save_progress(book_name, st.session_state.temp_page)
-                st.rerun()
-
-        st.image(get_page_image(book_path, st.session_state.temp_page), use_container_width=True)
-        
-        with st.spinner("載入中..."):
-            current_text = get_processed_text(book_path, st.session_state.temp_page)
-            audio_data = get_cached_audio(current_text)
-        
-        if audio_data:
-            st.audio(audio_data, format="audio/mp3", autoplay=auto_next)
-        
-        # 底部翻頁
-        st.divider()
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("❮ 上一頁") and st.session_state.temp_page > 0:
-                st.session_state.temp_page -= 1
-                save_progress(book_name, st.session_state.temp_page)
-                st.rerun()
-        with b2:
-            if st.button("下一頁 ❯") and st.session_state.temp_page < total_pages - 1:
-                st.session_state.temp_page += 1
-                save_progress(book_name, st.session_state.temp_page)
-                st.rerun()
-    except Exception as e:
-        st.error(f"讀取書籍出錯: {e}")
-        if st.button("返回重試"):
+    # 頂部控制
+    c1, c2 = st.columns([0.4, 0.6])
+    with c1:
+        if st.button("❮ 返回"):
             st.session_state.current_book = None
+            if "temp_page" in st.session_state: del st.session_state.temp_page
+            st.rerun()
+    with c2:
+        auto_next = st.toggle("自動翻頁", value=False)
+
+    # 跳轉區 (置頂)
+    col_j1, col_j2 = st.columns([0.6, 0.4])
+    with col_j1:
+        target_page = st.number_input(f"頁碼 (共 {total_pages} 頁)", min_value=1, max_value=total_pages, value=st.session_state.temp_page + 1, label_visibility="collapsed")
+    with col_j2:
+        if st.button("🚀 跳轉"):
+            st.session_state.temp_page = target_page - 1
+            save_progress(book_name, st.session_state.temp_page)
+            st.rerun()
+
+    st.divider()
+
+    # 顯示圖片
+    img_data = get_page_image(book_path, st.session_state.temp_page)
+    if img_data:
+        st.image(img_data, use_container_width=True)
+    
+    # 語音與 OCR
+    with st.spinner("載入中..."):
+        current_text = get_processed_text(book_path, st.session_state.temp_page)
+        audio_data = get_cached_audio(current_text)
+    
+    if audio_data:
+        st.audio(audio_data, format="audio/mp3", autoplay=auto_next)
+    
+    # 背景預讀
+    background_prefetch(book_path, st.session_state.temp_page, total_pages)
+
+    # 底部翻頁
+    st.divider()
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("❮ 上一頁") and st.session_state.temp_page > 0:
+            st.session_state.temp_page -= 1
+            save_progress(book_name, st.session_state.temp_page)
+            st.rerun()
+    with b2:
+        if st.button("下一頁 ❯") and st.session_state.temp_page < total_pages - 1:
+            st.session_state.temp_page += 1
+            save_progress(book_name, st.session_state.temp_page)
             st.rerun()
