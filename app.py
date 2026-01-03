@@ -9,177 +9,176 @@ import threading
 import pytesseract
 from PIL import Image
 import io
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# --- 關鍵修正：指定雲端 Linux 的 Tesseract 路徑 ---
+# --- 配置區 ---
+DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN"
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
-
-SAVE_DIR = "my_books"
-PROGRESS_FILE = "progress.json"
+SAVE_DIR = "temp_books"
+PROGRESS_FILE = "drive_progress.json"
 VOICE = "zh-TW-HsiaoChenNeural"
 SPEED = "+10%"
-PREFETCH_COUNT = 2
 
-# 確保資料夾存在
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- 核心快取層 ---
+# --- Google Drive 服務初始化 ---
+@st.cache_resource
+def get_drive_service():
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(info)
+        return build('drive', 'v3', credentials=creds)
+    return None
+
+drive_service = get_drive_service()
+
+# --- 雲端檔案同步功能 ---
+def list_drive_files():
+    query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    return results.get('files', [])
+
+def download_file(file_id, local_path):
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.FileIO(local_path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+def upload_file(local_path, filename):
+    file_metadata = {'name': filename, 'parents': [DRIVE_FOLDER_ID]}
+    media = MediaFileUpload(local_path, resumable=True)
+    drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+
+# --- 進度儲存至 Drive ---
+def load_remote_progress():
+    query = f"name = '{PROGRESS_FILE}' and '{DRIVE_FOLDER_ID}' in parents"
+    res = drive_service.files().list(q=query).execute().get('files', [])
+    if res:
+        request = drive_service.files().get_media(fileId=res[0]['id'])
+        return json.loads(request.execute())
+    return {}
+
+def save_remote_progress(book_name, page_num):
+    data = load_remote_progress()
+    data[book_name] = page_num
+    content = json.dumps(data)
+    
+    query = f"name = '{PROGRESS_FILE}' and '{DRIVE_FOLDER_ID}' in parents"
+    res = drive_service.files().list(q=query).execute().get('files', [])
+    
+    media = MediaFileUpload(io.BytesIO(content.encode()), mimetype='application/json')
+    if res:
+        drive_service.files().update(fileId=res[0]['id'], media_body=media).execute()
+    else:
+        meta = {'name': PROGRESS_FILE, 'parents': [DRIVE_FOLDER_ID]}
+        drive_service.files().create(body=meta, media_body=media).execute()
+
+# --- 核心閱讀功能 (保留預讀與 OCR) ---
 @st.cache_data(show_spinner=False)
-def get_page_image(book_path, page_num):
-    try:
-        doc = fitz.open(book_path)
-        page = doc[page_num]
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return img_bytes
-    except:
-        return None
+def get_page_content(book_path, page_num):
+    doc = fitz.open(book_path)
+    page = doc[page_num]
+    # 圖片
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+    img_bytes = pix.tobytes("png")
+    # 文字 OCR
+    text = page.get_text().strip()
+    if not text:
+        text = pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)), lang='chi_tra+eng')
+    doc.close()
+    return img_bytes, text.replace('\n', ' ')
 
 @st.cache_data(show_spinner=False)
-def get_processed_text(book_path, page_num):
-    try:
-        doc = fitz.open(book_path)
-        page = doc[page_num]
-        text = page.get_text().strip()
-        if not text:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img, lang='chi_tra+eng')
-        doc.close()
-        return text.replace('\n', ' ')
-    except:
-        return ""
-
-@st.cache_data(show_spinner=False)
-def get_cached_audio(text):
-    if not text or not text.strip(): return None
-    async def generate():
+def get_audio(text):
+    if not text.strip(): return None
+    async def gen():
         c = edge_tts.Communicate(text, VOICE, rate=SPEED)
         data = b""
         async for chunk in c.stream():
             if chunk["type"] == "audio": data += chunk["data"]
         return data
-    try:
-        return asyncio.run(generate())
-    except:
-        return None
-
-# --- 背景預讀機制 ---
-def background_prefetch(book_path, current_page, total_pages):
-    def prefetch_worker():
-        for i in range(1, PREFETCH_COUNT + 1):
-            target = current_page + i
-            if target < total_pages:
-                _ = get_page_image(book_path, target)
-                txt = get_processed_text(book_path, target)
-                _ = get_cached_audio(txt)
-    threading.Thread(target=prefetch_worker, daemon=True).start()
-
-def load_progress():
-    if os.path.exists(PROGRESS_FILE):
-        try:
-            with open(PROGRESS_FILE, "r") as f: return json.load(f)
-        except: return {}
-    return {}
-
-def save_progress(book_name, page_num):
-    data = load_progress()
-    data[book_name] = page_num
-    with open(PROGRESS_FILE, "w") as f: json.dump(data, f)
+    return asyncio.run(gen())
 
 # --- UI 介面 ---
 st.set_page_config(page_title="專業雲端閱讀器", layout="centered")
-st.markdown("<style>.stApp { background-color: white; } .stButton>button { border: 1px solid black !important; border-radius: 4px !important; background-color: white !important; color: black !important; }</style>", unsafe_allow_html=True)
+st.markdown("<style>.stApp { background-color: white; } .stButton>button { border: 1px solid black !important; border-radius: 4px !important; }</style>", unsafe_allow_html=True)
 
 if "current_book" not in st.session_state:
     st.session_state.current_book = None
 
-existing_books = [f for f in os.listdir(SAVE_DIR) if f.endswith(".pdf")]
-
-# 1. 圖書館模式
+# --- 1. 圖書館 ---
 if st.session_state.current_book is None:
     st.title("📚 我的雲端書庫")
-    if existing_books:
-        for book in existing_books:
-            col_b1, col_b2 = st.columns([0.8, 0.2])
-            with col_b1:
-                if st.button(f"📖 繼續閱讀：{book}", key=book):
-                    st.session_state.current_book = book
-                    if "temp_page" in st.session_state: del st.session_state.temp_page
-                    st.rerun()
-            with col_b2:
-                if st.button("🗑️", key=f"del_{book}"):
-                    os.remove(os.path.join(SAVE_DIR, book))
-                    st.rerun()
+    files = list_drive_files()
+    for f in [x for x in files if x['name'].endswith('.pdf')]:
+        col1, col2 = st.columns([0.8, 0.2])
+        with col1:
+            if st.button(f"📖 {f['name']}", key=f['id']):
+                local_path = os.path.join(SAVE_DIR, f['name'])
+                if not os.path.exists(local_path):
+                    with st.spinner("從雲端下載中..."):
+                        download_file(f['id'], local_path)
+                st.session_state.current_book = f['name']
+                st.rerun()
     st.divider()
-    uploaded_file = st.file_uploader("匯入新 PDF", type="pdf")
-    if uploaded_file:
-        with open(os.path.join(SAVE_DIR, uploaded_file.name), "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.session_state.current_book = uploaded_file.name
-        if "temp_page" in st.session_state: del st.session_state.temp_page
+    up = st.file_uploader("匯入新書", type="pdf")
+    if up:
+        l_path = os.path.join(SAVE_DIR, up.name)
+        with open(l_path, "wb") as f: f.write(up.getbuffer())
+        with st.spinner("同步至雲端硬碟..."):
+            upload_file(l_path, up.name)
+        st.session_state.current_book = up.name
         st.rerun()
 
-# 2. 閱讀器模式
+# --- 2. 閱讀器 ---
 else:
     book_name = st.session_state.current_book
     book_path = os.path.join(SAVE_DIR, book_name)
-    
-    with fitz.open(book_path) as doc_info:
-        total_pages = len(doc_info)
+    doc = fitz.open(book_path)
+    total = len(doc)
     
     if "temp_page" not in st.session_state:
-        st.session_state.temp_page = load_progress().get(book_name, 0)
+        st.session_state.temp_page = load_remote_progress().get(book_name, 0)
 
     # 頂部控制
     c1, c2 = st.columns([0.4, 0.6])
     with c1:
         if st.button("❮ 返回"):
             st.session_state.current_book = None
-            if "temp_page" in st.session_state: del st.session_state.temp_page
             st.rerun()
     with c2:
         auto_next = st.toggle("自動翻頁", value=False)
 
-    # 跳轉區 (置頂)
-    col_j1, col_j2 = st.columns([0.6, 0.4])
-    with col_j1:
-        target_page = st.number_input(f"頁碼 (共 {total_pages} 頁)", min_value=1, max_value=total_pages, value=st.session_state.temp_page + 1, label_visibility="collapsed")
-    with col_j2:
-        if st.button("🚀 跳轉"):
-            st.session_state.temp_page = target_page - 1
-            save_progress(book_name, st.session_state.temp_page)
-            st.rerun()
+    # 跳轉
+    t_page = st.number_input(f"頁碼 / 共 {total} 頁", 1, total, st.session_state.temp_page + 1)
+    if t_page - 1 != st.session_state.temp_page:
+        st.session_state.temp_page = t_page - 1
+        save_remote_progress(book_name, st.session_state.temp_page)
+        st.rerun()
 
-    st.divider()
+    # 顯示與朗讀
+    img, txt = get_page_content(book_path, st.session_state.temp_page)
+    st.image(img, use_container_width=True)
+    
+    with st.spinner("載入語音..."):
+        audio = get_audio(txt)
+    if audio:
+        st.audio(audio, format="audio/mp3", autoplay=auto_next)
 
-    # 顯示圖片
-    img_data = get_page_image(book_path, st.session_state.temp_page)
-    if img_data:
-        st.image(img_data, use_container_width=True)
-    
-    # 語音與 OCR
-    with st.spinner("載入中..."):
-        current_text = get_processed_text(book_path, st.session_state.temp_page)
-        audio_data = get_cached_audio(current_text)
-    
-    if audio_data:
-        st.audio(audio_data, format="audio/mp3", autoplay=auto_next)
-    
-    # 背景預讀
-    background_prefetch(book_path, st.session_state.temp_page, total_pages)
-
-    # 底部翻頁
+    # 翻頁
     st.divider()
     b1, b2 = st.columns(2)
     with b1:
         if st.button("❮ 上一頁") and st.session_state.temp_page > 0:
             st.session_state.temp_page -= 1
-            save_progress(book_name, st.session_state.temp_page)
+            save_remote_progress(book_name, st.session_state.temp_page)
             st.rerun()
     with b2:
-        if st.button("下一頁 ❯") and st.session_state.temp_page < total_pages - 1:
+        if st.button("下一頁 ❯") and st.session_state.temp_page < total - 1:
             st.session_state.temp_page += 1
-            save_progress(book_name, st.session_state.temp_page)
+            save_remote_progress(book_name, st.session_state.temp_page)
             st.rerun()
