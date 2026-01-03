@@ -1,4 +1,0 @@
-tesseract-ocr
-tesseract-ocr-chi-tra
-tesseract-ocr-eng
-libgl1
