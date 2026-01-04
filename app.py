@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # --- 配置區 ---
-DRIVE_FOLDER_ID = "您的資料夾ID貼在這裡" # <--- 請務必確認填寫正確
+DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN" # <--- 請務必確認填寫正確
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 SAVE_DIR = "temp_books"
 VOICE = "zh-TW-HsiaoChenNeural"
@@ -201,3 +201,4 @@ else:
             st.session_state.temp_page += 1
             save_book_progress(book_name, st.session_state.temp_page)
             st.rerun()
+
