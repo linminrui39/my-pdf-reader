@@ -12,21 +12,21 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# --- [1] 初始化設定 (必須在最前面) ---
+# --- [1] 初始化設定 ---
 st.set_page_config(page_title="專業雲端閱讀器", layout="centered")
 
-# --- [2] 配置區 ---
+# --- 配置區 ---
 DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN" 
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 SAVE_DIR = "temp_books"
 MASTER_PROGRESS_FILE = "all_books_progress.json"
 VOICE = "zh-TW-HsiaoChenNeural"
 SPEED = "+10%"
-PREFETCH_COUNT = 1 # 預讀下一頁
+PREFETCH_COUNT = 1
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- [3] Google Drive 服務 ---
+# --- [2] Google Drive 服務 ---
 @st.cache_resource(ttl=3600)
 def get_drive_service():
     if "gcp_service_account" in st.secrets:
@@ -39,7 +39,7 @@ def get_drive_service():
 
 drive_service = get_drive_service()
 
-# --- [4] 進度管理系統 ---
+# --- [3] 進度與檔案管理 ---
 def sync_progress_from_cloud():
     if not drive_service: return {}
     try:
@@ -66,7 +66,14 @@ def save_progress_to_cloud():
             drive_service.files().create(body=meta, media_body=media).execute()
     except: pass
 
-# --- [5] 核心渲染與語音功能 (含快取) ---
+def download_file(file_id, local_path):
+    request = drive_service.files().get_media(fileId=file_id)
+    with open(local_path, 'wb') as f:
+        downloader = MediaIoBaseDownload(f, request)
+        done = False
+        while not done: _, done = downloader.next_chunk()
+
+# --- [4] 核心渲染與預讀 (圖片 + 語音) ---
 @st.cache_data(show_spinner=False)
 def get_page_content(book_path, page_num):
     try:
@@ -92,28 +99,24 @@ def get_audio(text):
         return data
     return asyncio.run(gen())
 
-# --- [6] 改進版預讀機制 (同時預載圖片、文字與語音) ---
 def background_prefetch(book_path, current_page, total_pages):
     def prefetch_worker():
         target = current_page + 1
         if target < total_pages:
-            # 1. 預讀圖片與文字
             _, text = get_page_content(book_path, target)
-            # 2. 預讀語音檔案
-            if text:
-                _ = get_audio(text)
-    
+            if text: _ = get_audio(text)
     threading.Thread(target=prefetch_worker, daemon=True).start()
 
-def download_file(file_id, local_path):
-    request = drive_service.files().get_media(fileId=file_id)
-    with open(local_path, 'wb') as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done: _, done = downloader.next_chunk()
+# --- [5] 跳轉處理函數 (解決點兩下問題) ---
+def open_book_callback(name, page, file_id):
+    l_path = os.path.join(SAVE_DIR, name)
+    if not os.path.exists(l_path):
+        download_file(file_id, l_path)
+    st.session_state.current_book = name
+    st.session_state.temp_page = page
 
 # ---------------------------------------------------------
-# [7] 主程式邏輯
+# 主程式邏輯
 # ---------------------------------------------------------
 
 if "global_progress" not in st.session_state:
@@ -131,26 +134,28 @@ if st.session_state.current_book is None:
         st.session_state.global_progress = sync_progress_from_cloud()
         st.rerun()
 
-    query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
-    try:
+    if not drive_service:
+        st.error("連線失敗")
+    else:
+        query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
         files = drive_service.files().list(q=query, fields="files(id, name)").execute().get('files', [])
         pdf_files = [x for x in files if x['name'].lower().endswith('.pdf')]
+        
         for f in pdf_files:
             saved_p = st.session_state.global_progress.get(f['name'], 0)
             c1, c2 = st.columns([0.8, 0.2])
             with c1:
-                if st.button(f"📖 {f['name']} (讀至第 {saved_p + 1} 頁)", key=f['id']):
-                    l_path = os.path.join(SAVE_DIR, f['name'])
-                    if not os.path.exists(l_path):
-                        with st.spinner("下載中..."): download_file(f['id'], l_path)
-                    st.session_state.current_book = f['name']
-                    st.session_state.temp_page = saved_p
-                    st.rerun()
+                # 使用 on_click 確保一鍵跳轉
+                st.button(
+                    f"📖 {f['name']} (讀至第 {saved_p + 1} 頁)", 
+                    key=f['id'],
+                    on_click=open_book_callback,
+                    args=(f['name'], saved_p, f['id'])
+                )
             with c2:
                 if st.button("🗑️", key=f"del_{f['id']}"):
                     drive_service.files().delete(fileId=f['id']).execute()
                     st.rerun()
-    except: pass
 
 # --- B. 閱讀器介面 ---
 else:
@@ -167,7 +172,7 @@ else:
                 st.session_state.current_book = None
                 st.rerun()
         with c2:
-            # 【修正 2】將自動播放預設設為 False
+            # 預設不自動播放，且不放在初始化避免重整
             auto_next = st.toggle("自動播放語音", value=False)
 
         t_page = st.number_input(f"頁碼 (1-{total})", 1, total, value=st.session_state.temp_page + 1)
@@ -178,18 +183,18 @@ else:
             st.rerun()
 
         st.divider()
-        
         img_data, text_content = get_page_content(book_path, st.session_state.temp_page)
         
         if img_data:
             st.image(img_data, use_column_width=True)
-            # 【關鍵優化】顯示當前頁面時，同步預取「下一頁」的文字與語音
+            # 觸發背景預載「下一頁圖片與語音」
             background_prefetch(book_path, st.session_state.temp_page, total)
         
         if text_content:
             with st.spinner("語音載入中..."):
                 audio = get_audio(text_content)
             if audio:
+                # 如果 auto_next 為 False，進入頁面時就不會自動發聲
                 st.audio(audio, format="audio/mp3", autoplay=auto_next)
 
         st.divider()
