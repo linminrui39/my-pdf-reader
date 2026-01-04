@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# 必須是第一個 st 指令
+# --- 【核心修正 1】：設定頁面並立即處理網址參數 ---
 st.set_page_config(page_title="專業雲端閱讀器", layout="centered")
 
 # --- 配置區 ---
@@ -37,6 +37,7 @@ def get_drive_service():
 
 drive_service = get_drive_service()
 
+# --- 雲端進度管理 ---
 def sync_progress_from_cloud():
     if not drive_service: return {}
     try:
@@ -83,8 +84,7 @@ def get_page_content(book_path, page_num):
             text = pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)), lang='chi_tra+eng')
         doc.close()
         return img_bytes, text.replace('\n', ' ')
-    except:
-        return None, ""
+    except: return None, ""
 
 @st.cache_data(show_spinner=False)
 def get_audio(text):
@@ -97,18 +97,35 @@ def get_audio(text):
         return data
     return asyncio.run(gen())
 
-# 初始化 Session
+# --- 【核心修正 2】：從網址參數初始化狀態 ---
+# 如果網址有 book 參數，優先使用網址的
+params = st.query_params
+
 if "global_progress" not in st.session_state:
     st.session_state.global_progress = sync_progress_from_cloud()
-if "current_book" not in st.session_state:
+
+# 決定目前書籍
+if "book" in params:
+    st.session_state.current_book = params["book"]
+elif "current_book" not in st.session_state:
     st.session_state.current_book = None
-if "temp_page" not in st.session_state:
+
+# 決定目前頁碼 (網址優先 -> 雲端優先 -> 預設 0)
+if "page" in params:
+    st.session_state.temp_page = int(params["page"])
+elif st.session_state.current_book:
+    st.session_state.temp_page = st.session_state.global_progress.get(st.session_state.current_book, 0)
+else:
     st.session_state.temp_page = 0
 
 # --- 1. 圖書館 ---
 if st.session_state.current_book is None:
     st.title("📚 我的雲端書庫")
-    if st.button("🔄 刷新雲端清單"):
+    
+    # 確保網址清乾淨
+    st.query_params.clear()
+
+    if st.button("🔄 刷新雲端"):
         st.cache_data.clear()
         st.session_state.global_progress = sync_progress_from_cloud()
         st.rerun()
@@ -121,13 +138,16 @@ if st.session_state.current_book is None:
         for f in pdf_files:
             c1, c2 = st.columns([0.8, 0.2])
             with c1:
-                saved_page = st.session_state.global_progress.get(f['name'], 0)
-                if st.button(f"📖 {f['name']} (讀至第 {saved_page + 1} 頁)", key=f['id']):
+                saved_p = st.session_state.global_progress.get(f['name'], 0)
+                if st.button(f"📖 {f['name']} (第 {saved_p + 1} 頁)", key=f['id']):
                     l_path = os.path.join(SAVE_DIR, f['name'])
                     if not os.path.exists(l_path):
                         with st.spinner("下載中..."): download_file(f['id'], l_path)
+                    
+                    # 更新網址參數並跳轉
+                    st.query_params.update({"book": f['name'], "page": saved_p})
                     st.session_state.current_book = f['name']
-                    st.session_state.temp_page = saved_page
+                    st.session_state.temp_page = saved_p
                     st.rerun()
             with c2:
                 if st.button("🗑️", key=f"del_{f['id']}"):
@@ -137,34 +157,47 @@ else:
     # --- 2. 閱讀器 ---
     book_name = st.session_state.current_book
     book_path = os.path.join(SAVE_DIR, book_name)
+    
+    # 如果本地沒檔案(例如刷新後)，重新下載
+    if not os.path.exists(book_path):
+        query = f"name = '{book_name}' and '{DRIVE_FOLDER_ID}' in parents"
+        res = drive_service.files().list(q=query).execute().get('files', [])
+        if res:
+            with st.spinner("重新載入書籍..."): download_file(res[0]['id'], book_path)
+        else:
+            st.query_params.clear()
+            st.session_state.current_book = None
+            st.rerun()
+
     doc = fitz.open(book_path)
     total = len(doc)
     
-    col_nav1, col_nav2 = st.columns([0.3, 0.7])
-    with col_nav1:
+    # 頂部控制
+    c1, c2 = st.columns([0.3, 0.7])
+    with c1:
         if st.button("❮ 返回"):
-            st.session_state.global_progress[book_name] = st.session_state.temp_page
-            save_progress_to_cloud()
+            st.query_params.clear()
             st.session_state.current_book = None
             st.rerun()
-    with col_nav2:
+    with c2:
         auto_next = st.toggle("自動翻頁", value=False)
 
+    # 頁碼跳轉
     t_page = st.number_input(f"頁碼 (1-{total})", 1, total, value=st.session_state.temp_page + 1)
+    
     if t_page - 1 != st.session_state.temp_page:
         st.session_state.temp_page = t_page - 1
+        # 同步更新雲端、Session 和 網址列
         st.session_state.global_progress[book_name] = st.session_state.temp_page
+        st.query_params.update({"book": book_name, "page": st.session_state.temp_page})
         save_progress_to_cloud()
         st.rerun()
 
     st.divider()
     
-    # 核心修正：檢查數據並使用相容參數
     img_data, text_content = get_page_content(book_path, st.session_state.temp_page)
     if img_data:
         st.image(img_data, use_column_width=True)
-    else:
-        st.error("圖片載入失敗")
     
     if text_content:
         with st.spinner("朗讀中..."):
@@ -172,18 +205,20 @@ else:
         if audio:
             st.audio(audio, format="audio/mp3", autoplay=auto_next)
 
-    # 翻頁
+    # 底部按鈕
     st.divider()
     b1, b2 = st.columns(2)
     with b1:
         if st.button("❮ 上一頁") and st.session_state.temp_page > 0:
             st.session_state.temp_page -= 1
             st.session_state.global_progress[book_name] = st.session_state.temp_page
+            st.query_params.update({"book": book_name, "page": st.session_state.temp_page})
             save_progress_to_cloud()
             st.rerun()
     with b2:
         if st.button("下一頁 ❯") and st.session_state.temp_page < total - 1:
             st.session_state.temp_page += 1
             st.session_state.global_progress[book_name] = st.session_state.temp_page
+            st.query_params.update({"book": book_name, "page": st.session_state.temp_page})
             save_progress_to_cloud()
             st.rerun()
