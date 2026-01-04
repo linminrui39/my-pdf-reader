@@ -16,7 +16,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 st.set_page_config(page_title="專業雲端閱讀器", layout="centered")
 
 # --- [2] 配置區 ---
-DRIVE_FOLDER_ID = "您的資料夾ID貼在這裡" 
+DRIVE_FOLDER_ID = "1_vHNLHwMNT-mzSJSH5QCS5f5UGxgacGN" 
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 SAVE_DIR = "temp_books"
 MASTER_PROGRESS_FILE = "all_books_progress.json"
@@ -206,4 +206,5 @@ else:
                 st.session_state.global_progress[book_name] = st.session_state.temp_page
                 save_progress_to_cloud()
                 st.rerun()
+
 
